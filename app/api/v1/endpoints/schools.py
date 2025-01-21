@@ -6,6 +6,7 @@ from app.models import models
 from app.schemas import school
 from app.core.security import get_password_hash
 import secrets
+from datetime import datetime, timedelta
 
 router = APIRouter()
 
@@ -17,16 +18,27 @@ def create_school(
     current_user: models.User = Depends(deps.get_current_active_user),
 ) -> Any:
     """
-    Create new school.
+    Create new school with subscription details.
     """
     if current_user.role != models.UserRole.ADMIN:
         raise HTTPException(status_code=403, detail="Not enough permissions")
     
+    # Set subscription expiry based on type
+    subscription_expires_at = datetime.utcnow() + timedelta(days=365)  # Default 1 year
+    
     school_obj = models.School(
         name=school_in.name,
         description=school_in.description,
-        configuration=school_in.configuration,
-        api_key=secrets.token_urlsafe(32)
+        subscription_type=school_in.subscription_type,
+        max_users=school_in.max_users,
+        features_enabled=school_in.features_enabled or {},
+        contact_email=school_in.contact_email,
+        contact_phone=school_in.contact_phone,
+        address=school_in.address,
+        settings=school_in.settings or {},
+        configuration=school_in.configuration or {},
+        api_key=secrets.token_urlsafe(32),
+        subscription_expires_at=subscription_expires_at
     )
     db.add(school_obj)
     db.commit()
@@ -75,7 +87,7 @@ def update_school(
     current_user: models.User = Depends(deps.get_current_active_user),
 ) -> Any:
     """
-    Update school.
+    Update school details including subscription and settings.
     """
     school_obj = db.query(models.School).filter(models.School.id == school_id).first()
     if not school_obj:
@@ -84,6 +96,12 @@ def update_school(
         raise HTTPException(status_code=403, detail="Not enough permissions")
     
     update_data = school_in.dict(exclude_unset=True)
+    
+    # Validate max_users if provided
+    if "max_users" in update_data and update_data["max_users"] is not None:
+        if update_data["max_users"] < 1:
+            raise HTTPException(status_code=400, detail="Maximum users must be greater than 0")
+    
     for field, value in update_data.items():
         setattr(school_obj, field, value)
     

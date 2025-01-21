@@ -44,16 +44,16 @@ def read_ai_modules(
     """
     Retrieve AI modules.
     """
-    if current_user.role == models.UserRole.ADMIN:
-        modules = (
-            db.query(models.AIModule)
-            .filter(models.AIModule.school_id == current_user.school_id)
-            .offset(skip)
-            .limit(limit)
-            .all()
-        )
-    else:
+    if current_user.role not in [models.UserRole.ADMIN, models.UserRole.TEACHER]:
         raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    query = db.query(models.AIModule)
+    if current_user.role == models.UserRole.TEACHER:
+        if not current_user.school_id:
+            raise HTTPException(status_code=404, detail="No school associated with user")
+        query = query.filter(models.AIModule.school_id == current_user.school_id)
+    
+    modules = query.offset(skip).limit(limit).all()
     return modules
 
 @router.post("/enhance-content", response_model=ai_module.EnhancedContent)

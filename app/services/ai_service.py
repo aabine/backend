@@ -5,37 +5,94 @@ from app.models.models import LearningMaterial, StudentCourse, Course, User
 from sqlalchemy.orm import Session
 import json
 from app.core.cache import cache_service
+from circuitbreaker import circuit, CircuitBreakerError
+import httpx
+import asyncio
+import logging
+from prometheus_client import Counter, Histogram
+from tenacity import retry, stop_after_attempt, wait_exponential
+import structlog
+import backoff
+
+# Initialize metrics
+AI_REQUEST_COUNTER = Counter('ai_requests_total', 'Total number of AI API requests', ['operation'])
+AI_REQUEST_LATENCY = Histogram('ai_request_duration_seconds', 'AI request latency', ['operation'])
+AI_ERROR_COUNTER = Counter('ai_errors_total', 'Total number of AI API errors', ['operation', 'error_type'])
+
+logger = structlog.get_logger(__name__)
+
+class AIServiceError(Exception):
+    """Base exception for AI service errors."""
+    pass
 
 class AIService:
     def __init__(self, db: Session):
         self.db = db
-        openai.api_key = settings.OPENAI_API_KEY
+        self.client = httpx.AsyncClient(timeout=30.0)  # 30 second timeout
+        self.openai_client = openai.AsyncOpenAI(
+            api_key=settings.OPENAI_API_KEY,
+            timeout=30.0
+        )
+        self.logger = logger.bind(service="ai_service")
 
-    async def _get_cached_response(
-        self,
-        cache_key: str,
-        operation: str,
-        **kwargs
-    ) -> Optional[Dict[str, Any]]:
-        """Get cached response or generate new one."""
-        # Try to get from cache first
-        cached_response = await cache_service.get(cache_key)
-        if cached_response:
-            return cached_response
+    async def __aenter__(self):
+        return self
 
-        # Generate new response based on operation
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.client.aclose()
+
+    @circuit(failure_threshold=5, recovery_timeout=60)
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def _make_ai_request(self, operation: str, **kwargs) -> Dict[str, Any]:
+        """
+        Make an AI API request with circuit breaker and retry logic.
+        """
+        cache_key = cache_service._generate_cache_key(f"ai:{operation}", **kwargs)
+        cached_result = await cache_service.get(cache_key)
+        
+        if cached_result:
+            self.logger.info("cache_hit", operation=operation)
+            return cached_result
+
         try:
-            if operation == "chat_completion":
-                response = await openai.ChatCompletion.create(**kwargs)
-                result = response.choices[0].message.content
-            else:
-                raise ValueError(f"Unknown operation: {operation}")
+            with AI_REQUEST_LATENCY.labels(operation=operation).time():
+                AI_REQUEST_COUNTER.labels(operation=operation).inc()
+                
+                # Check cache first
+                cache_key = f"ai_request:{operation}:{hash(str(kwargs))}"
+                cached_result = await cache_service.get(cache_key)
+                if cached_result:
+                    return cached_result
 
-            # Cache the result
-            await cache_service.set(cache_key, result)
-            return result
+                # Make API call
+                response = await self.openai_client.chat.completions.create(**kwargs)
+                
+                # Cache successful response
+                result = response.choices[0].message.content
+                await cache_service.set(cache_key, result, ttl=3600)  # Cache for 1 hour
+                return result
+
+        except openai.APITimeoutError as e:
+            AI_ERROR_COUNTER.labels(operation=operation, error_type='timeout').inc()
+            self.logger.error(f"AI request timeout for {operation}: {str(e)}")
+            raise AIServiceError(f"Request timeout: {str(e)}")
+        except openai.APIError as e:
+            AI_ERROR_COUNTER.labels(operation=operation, error_type='api_error').inc()
+            self.logger.error(f"AI API error for {operation}: {str(e)}")
+            raise AIServiceError(f"API error: {str(e)}")
+        except CircuitBreakerError as e:
+            AI_ERROR_COUNTER.labels(operation=operation, error_type='circuit_breaker').inc()
+            self.logger.error(f"Circuit breaker open for {operation}: {str(e)}")
+            # Return cached result if available, otherwise raise
+            cached_result = await cache_service.get(cache_key)
+            if cached_result:
+                self.logger.info(f"Using cached result for {operation} due to circuit breaker")
+                return cached_result
+            raise AIServiceError(f"Service temporarily unavailable: {str(e)}")
         except Exception as e:
-            raise Exception(f"Error in AI operation: {str(e)}")
+            AI_ERROR_COUNTER.labels(operation=operation, error_type='unknown').inc()
+            self.logger.error(f"Unexpected error in AI request for {operation}: {str(e)}")
+            raise AIServiceError(f"Unexpected error: {str(e)}")
 
     async def enhance_learning_material(
         self,
@@ -43,41 +100,83 @@ class AIService:
         enhancement_type: str,
         school_config: Dict[str, Any]
     ) -> str:
-        """
-        Enhance learning material content using AI with caching.
-        """
-        cache_key = cache_service._generate_cache_key(
-            "enhance_material",
-            content=material.content,
-            enhancement_type=enhancement_type
-        )
-
-        system_prompt = (
-            "You are an expert educational content enhancer. "
-            "Your task is to improve educational content while maintaining accuracy "
-            "and adapting to the student's learning level."
-        )
-
-        enhancement_prompts = {
-            "simplify": "Simplify this content while maintaining its educational value:",
-            "elaborate": "Provide more detailed explanations and examples for this content:",
-            "interactive": "Transform this content into an interactive format with questions and exercises:",
-            "differentiate": "Adapt this content for different learning levels (basic, intermediate, advanced):",
-        }
-
+        """Enhance learning material content using AI."""
         try:
-            return await self._get_cached_response(
-                cache_key,
-                "chat_completion",
+            prompt = self._build_enhancement_prompt(material, enhancement_type, school_config)
+            return await self._make_ai_request(
+                "enhance_material",
+                messages=[{"role": "user", "content": prompt}],
                 model="gpt-4",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"{enhancement_prompts.get(enhancement_type, enhancement_prompts['elaborate'])}\n\n{material.content}"}
-                ],
                 temperature=0.7,
+                max_tokens=1000
             )
         except Exception as e:
-            raise Exception(f"Error enhancing content: {str(e)}")
+            self.logger.error(
+                "enhance_material_failed",
+                material_id=material.id,
+                error=str(e)
+            )
+            raise
+
+    async def analyze_learning_patterns(
+        self,
+        course: Course,
+        timeframe: str = "all"
+    ) -> Dict[str, Any]:
+        """Analyze learning patterns in a course."""
+        try:
+            enrollments = (
+                self.db.query(StudentCourse)
+                .filter(StudentCourse.course_id == course.id)
+                .all()
+            )
+            
+            if not enrollments:
+                raise ValueError("No student data found for analysis")
+
+            prompt = self._build_analysis_prompt(enrollments, timeframe)
+            return await self._make_ai_request(
+                "analyze_patterns",
+                messages=[{"role": "user", "content": prompt}],
+                model="gpt-4",
+                temperature=0.5,
+                max_tokens=1500
+            )
+        except Exception as e:
+            self.logger.error(
+                "analyze_patterns_failed",
+                course_id=course.id,
+                error=str(e)
+            )
+            raise
+
+    def _build_enhancement_prompt(
+        self,
+        material: LearningMaterial,
+        enhancement_type: str,
+        school_config: Dict[str, Any]
+    ) -> str:
+        """Build prompt for content enhancement."""
+        return f"""
+        Enhance the following {material.material_type} content using {enhancement_type} approach.
+        Consider these configurations: {json.dumps(school_config)}
+        
+        Content:
+        {material.content}
+        """
+
+    def _build_analysis_prompt(
+        self,
+        enrollments: List[StudentCourse],
+        timeframe: str
+    ) -> str:
+        """Build prompt for learning pattern analysis."""
+        return f"""
+        Analyze learning patterns for {len(enrollments)} students over {timeframe} timeframe.
+        
+        Progress Data:
+        {json.dumps([e.progress for e in enrollments])}
+        """
 
     async def generate_personalized_recommendations(
         self,
@@ -122,10 +221,8 @@ class AIService:
         )
 
         try:
-            recommendations = await self._get_cached_response(
-                cache_key,
-                "chat_completion",
-                model="gpt-4",
+            recommendations = await self._make_ai_request(
+                "recommendations",
                 messages=[
                     {
                         "role": "system",
@@ -140,7 +237,9 @@ class AIService:
                         "content": f"Based on this student's progress and available materials, provide personalized learning recommendations:\n\n{json.dumps(context, indent=2)}"
                     }
                 ],
+                model="gpt-4",
                 temperature=0.7,
+                max_tokens=1000
             )
 
             return {
@@ -151,64 +250,6 @@ class AIService:
             }
         except Exception as e:
             raise Exception(f"Error generating recommendations: {str(e)}")
-
-    async def analyze_learning_patterns(
-        self,
-        course: Course,
-        timeframe: Optional[str] = "all"
-    ) -> Dict[str, Any]:
-        """
-        Analyze learning patterns and engagement in a course.
-        """
-        # Get all enrollments for the course
-        enrollments = (
-            self.db.query(StudentCourse)
-            .filter(StudentCourse.course_id == course.id)
-            .all()
-        )
-
-        progress_data = [
-            {
-                "student_id": e.student_id,
-                "progress": e.progress,
-            }
-            for e in enrollments
-        ]
-
-        system_prompt = (
-            "You are an AI educational analyst specialized in learning patterns. "
-            "Analyze the course data to identify patterns, trends, and areas for improvement."
-        )
-
-        try:
-            response = await openai.ChatCompletion.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": (
-                            "Analyze this course data and provide insights on:\n"
-                            "1. Common learning patterns\n"
-                            "2. Engagement levels\n"
-                            "3. Areas where students are struggling\n"
-                            "4. Recommendations for course improvement\n\n"
-                            f"{json.dumps(progress_data, indent=2)}"
-                        )
-                    }
-                ],
-                temperature=0.7,
-            )
-
-            analysis = response.choices[0].message.content
-            return {
-                "course_id": course.id,
-                "analysis": analysis,
-                "raw_data": progress_data,
-                "timeframe": timeframe
-            }
-        except Exception as e:
-            raise Exception(f"Error analyzing learning patterns: {str(e)}")
 
     async def generate_adaptive_assessment(
         self,
@@ -225,8 +266,8 @@ class AIService:
         )
 
         try:
-            response = await openai.ChatCompletion.create(
-                model="gpt-4",
+            response = await self._make_ai_request(
+                "generate_assessment",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {
@@ -238,16 +279,23 @@ class AIService:
                         )
                     }
                 ],
+                model="gpt-4",
                 temperature=0.7,
+                max_tokens=1000
             )
 
-            assessment = response.choices[0].message.content
+            assessment = response
             return {
                 "material_id": material.id,
                 "student_level": student_level,
                 "assessment": assessment
             }
         except Exception as e:
+            self.logger.error(
+                "generate_assessment_failed",
+                material_id=material.id,
+                error=str(e)
+            )
             raise Exception(f"Error generating assessment: {str(e)}")
 
     async def provide_learning_insights(
@@ -284,8 +332,8 @@ class AIService:
         )
 
         try:
-            response = await openai.ChatCompletion.create(
-                model="gpt-4",
+            response = await self._make_ai_request(
+                "provide_insights",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {
@@ -300,10 +348,12 @@ class AIService:
                         )
                     }
                 ],
+                model="gpt-4",
                 temperature=0.7,
+                max_tokens=1000
             )
 
-            insights = response.choices[0].message.content
+            insights = response
             return {
                 "student_id": student.id,
                 "insights": insights,
@@ -311,6 +361,11 @@ class AIService:
                 "timeframe": timeframe
             }
         except Exception as e:
+            self.logger.error(
+                "get_insights_failed",
+                student_id=student.id,
+                error=str(e)
+            )
             raise Exception(f"Error generating learning insights: {str(e)}")
 
     async def generate_curriculum_plan(
@@ -337,8 +392,8 @@ class AIService:
         }
 
         try:
-            response = await openai.ChatCompletion.create(
-                model="gpt-4",
+            response = await self._make_ai_request(
+                "generate_curriculum_plan",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {
@@ -353,16 +408,23 @@ class AIService:
                         )
                     }
                 ],
+                model="gpt-4",
                 temperature=0.7,
+                max_tokens=1000
             )
 
-            curriculum_plan = response.choices[0].message.content
+            curriculum_plan = response
             return {
                 "course_id": course.id,
                 "curriculum_plan": curriculum_plan,
                 "context": context
             }
         except Exception as e:
+            self.logger.error(
+                "generate_curriculum_plan_failed",
+                course_id=course.id,
+                error=str(e)
+            )
             raise Exception(f"Error generating curriculum plan: {str(e)}")
 
     async def analyze_student_engagement(
@@ -402,8 +464,8 @@ class AIService:
         )
 
         try:
-            response = await openai.ChatCompletion.create(
-                model="gpt-4",
+            response = await self._make_ai_request(
+                "analyze_engagement",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {
@@ -418,10 +480,12 @@ class AIService:
                         )
                     }
                 ],
+                model="gpt-4",
                 temperature=0.7,
+                max_tokens=1000
             )
 
-            analysis = response.choices[0].message.content
+            analysis = response
             return {
                 "course_id": course.id,
                 "engagement_analysis": analysis,
@@ -429,6 +493,11 @@ class AIService:
                 "timeframe": timeframe
             }
         except Exception as e:
+            self.logger.error(
+                "analyze_engagement_failed",
+                course_id=course.id,
+                error=str(e)
+            )
             raise Exception(f"Error analyzing engagement: {str(e)}")
 
     async def generate_automated_feedback(
@@ -461,8 +530,8 @@ class AIService:
         }
 
         try:
-            response = await openai.ChatCompletion.create(
-                model="gpt-4",
+            response = await self._make_ai_request(
+                "generate_feedback",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {
@@ -474,10 +543,12 @@ class AIService:
                         )
                     }
                 ],
+                model="gpt-4",
                 temperature=0.7,
+                max_tokens=1000
             )
 
-            feedback = response.choices[0].message.content
+            feedback = response
             return {
                 "student_id": student.id,
                 "material_id": material.id,
@@ -486,6 +557,12 @@ class AIService:
                 "context": context
             }
         except Exception as e:
+            self.logger.error(
+                "generate_feedback_failed",
+                student_id=student.id,
+                material_id=material.id,
+                error=str(e)
+            )
             raise Exception(f"Error generating feedback: {str(e)}")
 
     async def predict_student_performance(
@@ -528,8 +605,8 @@ class AIService:
         )
 
         try:
-            response = await openai.ChatCompletion.create(
-                model="gpt-4",
+            response = await self._make_ai_request(
+                "predict_performance",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {
@@ -544,10 +621,12 @@ class AIService:
                         )
                     }
                 ],
+                model="gpt-4",
                 temperature=0.7,
+                max_tokens=1000
             )
 
-            prediction = response.choices[0].message.content
+            prediction = response
             return {
                 "student_id": student.id,
                 "course_id": course.id,
@@ -557,6 +636,12 @@ class AIService:
                 "raw_data": historical_data
             }
         except Exception as e:
+            self.logger.error(
+                "predict_performance_failed",
+                student_id=student.id,
+                course_id=course.id,
+                error=str(e)
+            )
             raise Exception(f"Error predicting performance: {str(e)}")
 
     async def generate_concept_map(
@@ -574,8 +659,8 @@ class AIService:
         )
 
         try:
-            response = await openai.ChatCompletion.create(
-                model="gpt-4",
+            response = await self._make_ai_request(
+                "generate_concept_map",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {
@@ -591,16 +676,23 @@ class AIService:
                         )
                     }
                 ],
+                model="gpt-4",
                 temperature=0.7,
+                max_tokens=1000
             )
 
-            concept_map = response.choices[0].message.content
+            concept_map = response
             return {
                 "material_id": material.id,
                 "concept_map": concept_map,
                 "complexity_level": complexity_level
             }
         except Exception as e:
+            self.logger.error(
+                "generate_concept_map_failed",
+                material_id=material.id,
+                error=str(e)
+            )
             raise Exception(f"Error generating concept map: {str(e)}")
 
     async def invalidate_cache(self, pattern: str) -> bool:

@@ -1,4 +1,4 @@
-from typing import Any, List
+from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -6,6 +6,13 @@ from app.api import deps
 from app.models import models
 from app.schemas import analytics
 from datetime import datetime, timedelta
+from app.services.analytics_service import AnalyticsService
+from app.schemas.analytics import (
+    StudentAnalytics, CourseAnalytics,
+    StudentProgressReport, AnalyticsRequest,
+    MetricType, TimeFrame
+)
+from app.models.models import User, UserRole
 
 router = APIRouter()
 
@@ -190,4 +197,156 @@ def get_ai_usage_stats(
         "ai_enhanced_materials": ai_enhanced_materials,
         "active_modules": len(active_modules),
         "module_stats": module_stats
-    } 
+    }
+
+@router.post("/track-activity")
+async def track_learning_activity(
+    *,
+    db: Session = Depends(deps.get_db),
+    student_id: int,
+    course_id: int,
+    activity_type: str,
+    module_id: Optional[int] = None,
+    duration: Optional[int] = None,
+    score: Optional[float] = None,
+    metadata: Optional[dict] = None,
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    Track a learning activity for analytics.
+    """
+    if current_user.role not in [UserRole.ADMIN, UserRole.TEACHER] and current_user.id != student_id:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    analytics_service = AnalyticsService(db)
+    return await analytics_service.track_learning_activity(
+        student_id=student_id,
+        course_id=course_id,
+        activity_type=activity_type,
+        module_id=module_id,
+        duration=duration,
+        score=score,
+        metadata=metadata
+    )
+
+@router.get("/student/{student_id}", response_model=StudentAnalytics)
+async def get_student_analytics(
+    student_id: int,
+    course_id: Optional[int] = None,
+    time_frame: TimeFrame = TimeFrame.ALL,
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    Get comprehensive analytics for a student.
+    """
+    if current_user.role not in [UserRole.ADMIN, UserRole.TEACHER] and current_user.id != student_id:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    analytics_service = AnalyticsService(db)
+    return await analytics_service.get_student_analytics(
+        student_id=student_id,
+        course_id=course_id,
+        time_frame=time_frame
+    )
+
+@router.get("/course/{course_id}", response_model=CourseAnalytics)
+async def get_course_analytics(
+    course_id: int,
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    Get comprehensive analytics for a course.
+    """
+    if current_user.role not in [UserRole.ADMIN, UserRole.TEACHER]:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    analytics_service = AnalyticsService(db)
+    return await analytics_service.get_course_analytics(course_id)
+
+@router.get("/progress-report/{student_id}", response_model=StudentProgressReport)
+async def get_student_progress_report(
+    student_id: int,
+    time_frame: TimeFrame = TimeFrame.ALL,
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    Generate a comprehensive progress report for a student.
+    """
+    if current_user.role not in [UserRole.ADMIN, UserRole.TEACHER] and current_user.id != student_id:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    analytics_service = AnalyticsService(db)
+    return await analytics_service.generate_student_progress_report(
+        student_id=student_id,
+        time_frame=time_frame
+    )
+
+@router.get("/dashboard/overview")
+async def get_dashboard_overview(
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    Get overview statistics for the analytics dashboard.
+    """
+    if current_user.role not in [UserRole.ADMIN, UserRole.TEACHER]:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    analytics_service = AnalyticsService(db)
+    
+    # Get overall statistics
+    total_students = await analytics_service.get_total_students()
+    active_students = await analytics_service.get_active_students()
+    course_completion_rates = await analytics_service.get_course_completion_rates()
+    engagement_metrics = await analytics_service.get_overall_engagement_metrics()
+    
+    return {
+        "total_students": total_students,
+        "active_students": active_students,
+        "course_completion_rates": course_completion_rates,
+        "engagement_metrics": engagement_metrics,
+        "updated_at": datetime.utcnow()
+    }
+
+@router.get("/dashboard/performance")
+async def get_performance_metrics(
+    course_id: Optional[int] = None,
+    time_frame: TimeFrame = TimeFrame.ALL,
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    Get detailed performance metrics for the analytics dashboard.
+    """
+    if current_user.role not in [UserRole.ADMIN, UserRole.TEACHER]:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    analytics_service = AnalyticsService(db)
+    
+    return await analytics_service.get_performance_metrics(
+        course_id=course_id,
+        time_frame=time_frame
+    )
+
+@router.get("/dashboard/engagement")
+async def get_engagement_metrics(
+    course_id: Optional[int] = None,
+    time_frame: TimeFrame = TimeFrame.ALL,
+    db: Session = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_active_user)
+):
+    """
+    Get detailed engagement metrics for the analytics dashboard.
+    """
+    if current_user.role not in [UserRole.ADMIN, UserRole.TEACHER]:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    analytics_service = AnalyticsService(db)
+    
+    return await analytics_service.get_engagement_metrics(
+        course_id=course_id,
+        time_frame=time_frame
+    ) 

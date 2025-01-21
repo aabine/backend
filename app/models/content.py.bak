@@ -1,0 +1,54 @@
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, Boolean, JSON, Enum as SQLEnum
+from sqlalchemy.orm import relationship
+from datetime import datetime
+from .base import Base
+from app.schemas.content import ContentType
+
+class Content(Base):
+    title = Column(String, nullable=False)
+    description = Column(String)
+    content_type = Column(SQLEnum(ContentType), nullable=False)
+    content_url = Column(String, nullable=False)
+    current_version = Column(Integer, default=1)
+    content_metadata = Column(JSON)
+    tags = Column(JSON, default=list)
+    is_public = Column(Boolean, default=False)
+    course_id = Column(Integer, ForeignKey("course.id"))
+    folder_id = Column(Integer, ForeignKey("contentfolder.id"))
+    created_by = Column(Integer, ForeignKey("user.id"), nullable=False)
+    download_count = Column(Integer, default=0)
+    view_count = Column(Integer, default=0)
+
+    # Relationships
+    versions = relationship("ContentVersion", back_populates="content")
+    course = relationship("Course", back_populates="content")
+    folder = relationship("ContentFolder", back_populates="content")
+    creator = relationship("User", back_populates="created_content")
+
+class ContentVersion(Base):
+    content_id = Column(Integer, ForeignKey("content.id"), nullable=False)
+    version = Column(Integer, nullable=False)
+    content_url = Column(String, nullable=False)
+    changes = Column(String)
+    created_by = Column(Integer, ForeignKey("user.id"), nullable=False)
+
+    # Relationships
+    content = relationship("Content", back_populates="versions")
+    creator = relationship("User")
+
+    class Config:
+        unique_together = [("content_id", "version")]
+
+class ContentFolder(Base):
+    name = Column(String, nullable=False)
+    description = Column(String)
+    parent_id = Column(Integer, ForeignKey("contentfolder.id"))
+    course_id = Column(Integer, ForeignKey("course.id"))
+    created_by = Column(Integer, ForeignKey("user.id"), nullable=False)
+
+    # Relationships
+    parent = relationship("ContentFolder", remote_side=[id])
+    subfolders = relationship("ContentFolder")
+    content = relationship("Content", back_populates="folder")
+    course = relationship("Course", back_populates="folders")
+    creator = relationship("User") 

@@ -5,6 +5,7 @@ from app.services.ai_service import AIService
 from sqlalchemy.orm import Session
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import logging
 
 celery_app = Celery(
     "ai_tasks",
@@ -17,6 +18,7 @@ class BatchProcessor:
         self.db = db
         self.max_concurrent = 5  # Maximum concurrent API calls
         self.executor = ThreadPoolExecutor(max_workers=self.max_concurrent)
+        self.logger = logging.getLogger(__name__)
 
     async def process_batch(
         self,
@@ -29,54 +31,67 @@ class BatchProcessor:
         """
         ai_service = AIService(self.db)
         
-        # Create tasks for each item
+        if not items:
+            return []
+
         tasks = []
         semaphore = asyncio.Semaphore(self.max_concurrent)
         
         async def process_item(item: Dict[str, Any]) -> Dict[str, Any]:
             async with semaphore:
                 try:
-                    if operation == "enhance_content":
-                        result = await ai_service.enhance_learning_material(
-                            material=item["material"],
-                            enhancement_type=item.get("enhancement_type", "elaborate"),
-                            school_config=kwargs.get("school_config", {})
-                        )
-                    elif operation == "analyze_progress":
-                        result = await ai_service.analyze_learning_patterns(
-                            course=item["course"],
-                            timeframe=item.get("timeframe", "all")
-                        )
-                    elif operation == "generate_feedback":
-                        result = await ai_service.generate_automated_feedback(
-                            student=item["student"],
-                            material=item["material"],
-                            submission_content=item["submission"],
-                            feedback_type=item.get("feedback_type", "comprehensive")
-                        )
-                    else:
-                        raise ValueError(f"Unknown operation: {operation}")
-                    
+                    if not isinstance(item, dict) or "id" not in item:
+                        raise ValueError("Invalid item format")
+                        
+                    result = await getattr(ai_service, operation)(**item, **kwargs)
                     return {
-                        "item_id": item.get("id"),
+                        "item_id": item["id"],
                         "status": "success",
                         "result": result
                     }
+                except AttributeError:
+                    self.logger.error(f"Operation {operation} not found")
+                    return {
+                        "item_id": item.get("id"),
+                        "status": "error",
+                        "error": f"Operation {operation} not found"
+                    }
                 except Exception as e:
+                    self.logger.error(f"Error processing item {item.get('id')}: {str(e)}")
                     return {
                         "item_id": item.get("id"),
                         "status": "error",
                         "error": str(e)
                     }
-        
-        # Create tasks for all items
-        for item in items:
-            task = asyncio.create_task(process_item(item))
-            tasks.append(task)
-        
-        # Wait for all tasks to complete
-        results = await asyncio.gather(*tasks)
-        return results
+
+        try:
+            for item in items:
+                tasks.append(asyncio.create_task(process_item(item)))
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Handle any unhandled exceptions from gather
+            processed_results = []
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    self.logger.error(f"Unhandled error in batch processing: {str(result)}")
+                    processed_results.append({
+                        "item_id": items[i].get("id"),
+                        "status": "error",
+                        "error": f"Unhandled error: {str(result)}"
+                    })
+                else:
+                    processed_results.append(result)
+                    
+            return processed_results
+            
+        except Exception as e:
+            self.logger.error(f"Critical error in batch processing: {str(e)}")
+            return [{
+                "item_id": None,
+                "status": "error",
+                "error": f"Batch processing failed: {str(e)}"
+            }]
 
 @celery_app.task
 def process_batch_task(operation: str, items: List[Dict[str, Any]], **kwargs) -> str:

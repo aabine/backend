@@ -28,17 +28,35 @@ async def get_current_user(
     )
     try:
         payload = jwt.decode(
-            token, settings.SECRET_KEY, algorithms=["HS256"]
+            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
         )
         user_id: str = payload.get("sub")
+        token_type: str = payload.get("type")
+        
         if user_id is None:
             raise credentials_exception
-    except JWTError:
-        raise credentials_exception
+        if token_type != "access":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token type",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    except JWTError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Token validation failed: {str(e)}",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     
     user = db.query(User).filter(User.id == int(user_id)).first()
     if user is None:
         raise credentials_exception
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Inactive user",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return user
 
 def get_current_active_user(
