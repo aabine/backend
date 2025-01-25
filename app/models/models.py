@@ -59,12 +59,14 @@ class School(Base):
     users = relationship("User", back_populates="school")
     courses = relationship("Course", back_populates="school")
     ai_modules = relationship("AIModule", back_populates="school")
+    grade_scales = relationship("GradeScale", back_populates="school")
 
 class Course(Base):
     name = Column(String, nullable=False)
     description = Column(Text)
     teacher_id = Column(Integer, ForeignKey("user.id"))
     school_id = Column(Integer, ForeignKey("school.id"))
+    grade_scale_id = Column(Integer, ForeignKey("grade_scale.id"))
     
     teacher = relationship("User", back_populates="courses")
     school = relationship("School", back_populates="courses")
@@ -72,6 +74,8 @@ class Course(Base):
     learning_materials = relationship("LearningMaterial", back_populates="course")
     modules = relationship("Module", back_populates="course")
     assessments = relationship("Assessment", back_populates="course")
+    grade_scale = relationship("GradeScale", back_populates="courses")
+    grade_weights = relationship("GradeWeight", back_populates="course")
 
 class StudentCourse(Base):
     student_id = Column(Integer, ForeignKey("user.id"))
@@ -416,4 +420,32 @@ class AuditLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Relationships
-    user = relationship("User", back_populates="audit_logs") 
+    user = relationship("User", back_populates="audit_logs")
+
+class GradeScale(Base):
+    __tablename__ = "grade_scale"
+
+    id = Column(Integer, primary_key=True, index=True)
+    school_id = Column(Integer, ForeignKey("school.id"), nullable=False)
+    name = Column(String, nullable=False)  # e.g., "A-F", "0-100", "Custom"
+    scale_type = Column(String, nullable=False)  # "letter", "numeric", "custom"
+    ranges = Column(JSON)  # e.g., {"A": {"min": 90, "max": 100}, "B": {"min": 80, "max": 89}}
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    school = relationship("School", back_populates="grade_scales")
+    courses = relationship("Course", back_populates="grade_scale")
+
+class GradeWeight(Base):
+    __tablename__ = "grade_weight"
+
+    id = Column(Integer, primary_key=True, index=True)
+    course_id = Column(Integer, ForeignKey("course.id"), nullable=False)
+    assessment_type = Column(Enum(AssessmentType), nullable=False)
+    weight = Column(Float, nullable=False)  # Percentage weight (0-100)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationships
+    course = relationship("Course", back_populates="grade_weights") 
